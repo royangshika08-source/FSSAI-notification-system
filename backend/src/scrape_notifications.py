@@ -27,12 +27,12 @@ SOURCE_URL = (
 BASE_URL = "https://www.fssai.gov.in/"
 
 
-START_DATE = datetime.strptime(
+DEFAULT_START_DATE = datetime.strptime(
     "01-12-2025",
     "%d-%m-%Y"
 ).date()
 
-END_DATE = datetime.strptime(
+DEFAULT_END_DATE = datetime.strptime(
     "31-05-2026",
     "%d-%m-%Y"
 ).date()
@@ -96,7 +96,10 @@ def wait_for_table(driver):
 
 def extract_current_page(
     driver,
-    page_number
+    page_number,
+    start_date,
+    end_date,
+    save_raw=True,
 ):
 
     wait_for_table(driver)
@@ -105,22 +108,23 @@ def extract_current_page(
     # Save rendered HTML for debugging/audit
     # --------------------------------------------------------
 
-    html = driver.page_source
+    if save_raw:
+        html = driver.page_source
 
-    RAW_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+        RAW_DIR.mkdir(
+            parents=True,
+            exist_ok=True
+        )
 
-    raw_file = (
-        RAW_DIR
-        / f"gazette_page_{page_number}.html"
-    )
+        raw_file = (
+            RAW_DIR
+            / f"gazette_page_{page_number}.html"
+        )
 
-    raw_file.write_text(
-        html,
-        encoding="utf-8"
-    )
+        raw_file.write_text(
+            html,
+            encoding="utf-8"
+        )
 
     # --------------------------------------------------------
     # Get PDF links directly from the browser DOM.
@@ -241,11 +245,10 @@ def extract_current_page(
         # ----------------------------------------------------
         # Required date range
         # ----------------------------------------------------
-
         if not (
-            START_DATE
+            start_date
             <= parsed_date
-            <= END_DATE
+            <= end_date
         ):
             continue
 
@@ -415,6 +418,40 @@ def get_pagination_signature(driver):
 
 
 # ============================================================
+# GET PAGINATION DETAILS
+# ============================================================
+
+def get_pagination_details(driver):
+    """Return the visible page range and the official result total.
+
+    The FSSAI page exposes pagination as text such as
+    ``Showing 1 to 10 of 316 entries``.  Using that total lets the
+    scraper finish at the end of the official archive instead of relying
+    on an arbitrary maximum number of pages.
+    """
+
+    body_text = driver.find_element(
+        By.TAG_NAME,
+        "body"
+    ).text
+
+    match = re.search(
+        r"Showing\s+(\d+)\s+to\s+(\d+)\s+of\s+(\d+)\s+entries"
+        r"(?:\s+\(filtered from \d+ total\))?",
+        body_text
+    )
+
+    if not match:
+        return None
+
+    return {
+        "first": int(match.group(1)),
+        "last": int(match.group(2)),
+        "total": int(match.group(3)),
+    }
+
+
+# ============================================================
 # CLICK NEXT PAGE
 # ============================================================
 
@@ -495,7 +532,21 @@ def go_to_next_page(driver):
 # MAIN SCRAPER
 # ============================================================
 
-def main():
+def main(
+    start_date=None,
+    end_date=None,
+    output_file=OUTPUT_FILE,
+    save_raw=True,
+):
+
+    if start_date is None:
+        start_date = DEFAULT_START_DATE
+
+    if end_date is None:
+        end_date = DEFAULT_END_DATE
+
+    if start_date > end_date:
+        raise ValueError("start_date cannot be after end_date")
 
     OUTPUT_DIR.mkdir(
         parents=True,
@@ -516,9 +567,9 @@ def main():
     print("\nRequired date range:")
 
     print(
-        START_DATE.strftime("%d-%m-%Y"),
+        start_date.strftime("%d-%m-%Y"),
         "to",
-        END_DATE.strftime("%d-%m-%Y")
+        end_date.strftime("%d-%m-%Y")
     )
 
     driver = create_driver()
@@ -540,16 +591,44 @@ def main():
         )
 
         page_number = 1
+        seen_pages = set()
 
         while True:
 
+            pagination = get_pagination_details(driver)
+
+            if pagination is None:
+                raise RuntimeError(
+                    "Could not read pagination from the official FSSAI page"
+                )
+
+            page_signature = (
+                pagination["first"],
+                pagination["last"],
+                pagination["total"],
+            )
+
+            # A repeated range means the portal did not advance.  Stop to
+            # avoid an infinite loop, without imposing a cap on the archive.
+            if page_signature in seen_pages:
+                raise RuntimeError(
+                    "FSSAI pagination repeated a page before the archive ended"
+                )
+
+            seen_pages.add(page_signature)
+
             print(
-                f"\nProcessing page {page_number}..."
+                f"\nProcessing page {page_number} "
+                f"(entries {pagination['first']}-{pagination['last']} "
+                f"of {pagination['total']})..."
             )
 
             records = extract_current_page(
                 driver,
-                page_number
+                page_number,
+                start_date,
+                end_date,
+                save_raw=save_raw,
             )
 
             print(
@@ -560,6 +639,15 @@ def main():
             all_records.extend(
                 records
             )
+
+            # The final visible page has reached the official result total.
+            # This intentionally supports every page in the archive, not
+            # only the first few pages or a fixed historical date range.
+            if pagination["last"] >= pagination["total"]:
+
+                print("Reached the final official FSSAI result page.")
+
+                break
 
             # ------------------------------------------------
             # PAGINATION
@@ -578,15 +666,6 @@ def main():
                 break
 
             page_number += 1
-
-            # Safety limit
-            if page_number > 50:
-
-                print(
-                    "Safety limit reached."
-                )
-
-                break
 
             time.sleep(0.5)
 
@@ -641,12 +720,23 @@ def main():
     # No source_snippet.
     # ========================================================
 
+    # Keep the latest notifications first, matching the official portal,
+    # and give the UI a stable identifier for every returned result.
+    all_records.sort(
+        key=lambda record: datetime.strptime(
+            record["uploaded_date"],
+            "%d-%m-%Y"
+        ),
+        reverse=True
+    )
+
     final_records = []
 
-    for record in all_records:
+    for index, record in enumerate(all_records, start=1):
 
         final_records.append(
             {
+                "id": index,
                 "title": record["title"],
                 "uploaded_date": record["uploaded_date"],
                 "Month": record["Month"],
@@ -655,7 +745,7 @@ def main():
             }
         )
 
-    OUTPUT_FILE.write_text(
+    output_file.write_text(
         json.dumps(
             final_records,
             indent=2,
@@ -684,8 +774,10 @@ def main():
 
     print(
         "JSON saved to:",
-        OUTPUT_FILE
+        output_file
     )
+
+    return final_records
 
 
 # ============================================================

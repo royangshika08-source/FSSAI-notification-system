@@ -234,9 +234,13 @@ for index, notification in enumerate(notifications, start=1):
     safe_title = clean_filename(title)
 
     filename = (
-        f"{index:03d}_"
         f"{uploaded_date.replace('-', '')}_"
         f"{safe_title}.pdf"
+    )
+
+    output_path = os.path.join(
+        PDF_FOLDER,
+        filename
     )
 
     output_path = os.path.join(
@@ -249,6 +253,24 @@ for index, notification in enumerate(notifications, start=1):
     # --------------------------------------------------------
     # Download
     # --------------------------------------------------------
+    if os.path.exists(output_path):
+
+        print("    PDF already exists - reusing existing file")
+
+        download_results.append({
+            "title": title,
+            "uploaded_date": uploaded_date,
+            "Month": notification.get("Month"),
+            "Year": notification.get("Year"),
+            "pdf_url": pdf_url,
+            "file_name": filename,
+            "local_path": output_path,
+            "status": "already_exists"
+})
+
+    successful += 1
+
+    continue
 
     success, message = download_pdf(
         pdf_url,
