@@ -18,7 +18,7 @@ from qdrant_client.models import (
 # PROJECT PATHS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = Path(__file__).resolve().parents[3]
 
 EMBEDDINGS_DIR = (
     BASE_DIR

@@ -6,12 +6,14 @@ import json
 import threading
 
 from datetime import datetime
+from google.genai import errors as genai_errors
 from src.scrape_notifications import main as scrape_notifications
 from src.model.gemini_analysis import analyze_notification_text
 from src.notification_monitor import (
     check_for_new_notifications,
     mark_notifications_read,
 )
+from src.on_demand_pipeline import ensure_extracted_notification
 
 
 app = FastAPI()
@@ -29,9 +31,13 @@ class ReadNotificationsRequest(BaseModel):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-    "http://localhost:5173",
-    "http://localhost:5174",
-],
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://[::1]:5173",
+        "http://[::1]:5174",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,9 +49,9 @@ app.add_middleware(
 # ============================================================
 
 # Go from:
-# data/backend/main.py
+# backend/main.py
 # up to the project root
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 
 # data/
 DATA_DIR = BASE_DIR / "data"
@@ -214,6 +220,7 @@ def get_new_notifications():
             "unread_count": len(result["notifications"]),
             "notifications": result["notifications"],
             "new_notifications": result["fresh_notifications"],
+            "latest_notification": result["latest_notification"],
             "last_successful_check": result["last_successful_check"],
         }
     except Exception as error:
@@ -235,6 +242,123 @@ def mark_new_notifications_read(request: ReadNotificationsRequest):
         return {"status": "OK", "updated": updated}
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error))
+
+# ============================================================
+# SHARED ANALYSIS POST-PROCESSING
+# ============================================================
+
+def finalize_analysis_result(result, original_pdf_file_name, pdf_url):
+    """Fill in metadata FSSAI/Gemini leaves out and normalize empty values."""
+
+    for regulation in result.get("regulations", []):
+
+        if not regulation.get("pdf_name"):
+            regulation["pdf_name"] = original_pdf_file_name
+
+        if not regulation.get("pdf_link"):
+            regulation["pdf_link"] = pdf_url
+
+    regulations = result.get("regulations", [])
+    affected_areas = result.get("affected_areas", [])
+
+    default_subsection = ""
+
+    if regulations:
+        default_subsection = regulations[0].get("subsection", "")
+
+    for area in affected_areas:
+        if not area.get("subsection"):
+            area["subsection"] = default_subsection
+
+    for regulation in result.get("regulations", []):
+        for field in [
+            "title",
+            "section",
+            "subsection",
+            "change",
+            "pdf_name",
+            "pdf_link",
+        ]:
+            if regulation.get(field) in (None, "", "None", "null"):
+                regulation[field] = ""
+
+    return result
+
+
+# ============================================================
+# ON-DEMAND NOTIFICATION PROCESSING
+# ============================================================
+#
+# Notifications returned by /api/notifications and /api/notifications/new
+# come straight from the FSSAI scraper and are not necessarily part of the
+# pre-processed sample set under data/extracted. These endpoints download
+# and extract a notification's PDF on first request (caching the result for
+# later requests) so analysis works for any notification, not only ones
+# already present locally.
+# ============================================================
+
+@app.get("/api/notification-details")
+def get_notification_details(title: str, uploaded_date: str, pdf_url: str = ""):
+    try:
+        return ensure_extracted_notification(title, uploaded_date, pdf_url)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to fetch or extract this notification: {error}",
+        )
+
+
+@app.get("/api/analyze-notification-by-source")
+def analyze_notification_by_source(title: str, uploaded_date: str, pdf_url: str = ""):
+    try:
+        extracted = ensure_extracted_notification(title, uploaded_date, pdf_url)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error))
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to fetch or extract this notification: {error}",
+        )
+
+    notification_text = extracted.get("text", "")
+
+    if not notification_text:
+        raise HTTPException(
+            status_code=400,
+            detail="No extracted text found in notification file",
+        )
+
+    try:
+        analysis = analyze_notification_text(
+            notification_text=notification_text,
+            pdf_url=pdf_url,
+            notification_title=title,
+            uploaded_date=uploaded_date,
+            file_name=extracted.get("file_name"),
+        )
+
+        result = json.loads(analysis)
+
+        return finalize_analysis_result(
+            result,
+            extracted.get("file_name"),
+            pdf_url,
+        )
+    except genai_errors.ServerError as error:
+        print("GEMINI ERROR:", repr(error))
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is temporarily overloaded. Please try this notification again in a moment.",
+        )
+    except Exception as error:
+        import traceback
+
+        print("GEMINI ERROR:", repr(error))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(error))
+
 
 # ============================================================
 # GEMINI ANALYSIS
@@ -348,69 +472,22 @@ def analyze_notification(file_name: str):
         )
 
         result = json.loads(analysis)
-        
-        # ----------------------------------------------------
-        # Ensure notification metadata is always preserved
-        # ----------------------------------------------------
 
-        for regulation in result.get("regulations", []):
-
-            if not regulation.get("pdf_name"):
-                regulation["pdf_name"] = original_pdf_file_name
-
-            if not regulation.get("pdf_link"):
-                regulation["pdf_link"] = pdf_url
-        # ----------------------------------------------------
-        # Ensure affected area metadata is always available
-        # ----------------------------------------------------
-
-        regulations = result.get("regulations", [])
-        affected_areas = result.get("affected_areas", [])
-
-        default_subsection = ""
-
-        if regulations:
-            default_subsection = regulations[0].get(
-                "subsection",
-                ""
+        return finalize_analysis_result(
+            result,
+            original_pdf_file_name,
+            pdf_url,
         )
-
-        for area in affected_areas:
-
-         if not area.get("subsection"):
-            area["subsection"] = default_subsection
-
-        # ----------------------------------------------------
-        # Make sure missing values are displayed consistently
-        # ----------------------------------------------------
-
-        for regulation in result.get(
-            "regulations",
-            []
-        ):
-
-            for field in [
-                "title",
-                "section",
-                "subsection",
-                "change",
-                "pdf_name",
-                "pdf_link"
-            ]:
-
-                if regulation.get(field) in (
-                    None,
-                    "",
-                    "None",
-                    "null"
-                ):
-
-                    regulation[field] = ""
-
-        return result
 
     except HTTPException:
         raise
+
+    except genai_errors.ServerError as e:
+        print("GEMINI ERROR:", repr(e))
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is temporarily overloaded. Please try this notification again in a moment.",
+        )
 
     except Exception as e:
         import traceback

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import "./App.css";
 
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = "http://127.0.0.1:8000";
 const NOTIFICATION_POLL_INTERVAL_MS = 5 * 60 * 1000;
 
 function App() {
@@ -14,6 +14,7 @@ function App() {
   const [analysisData, setAnalysisData] = useState(null);
   const [activeTab, setActiveTab] = useState("Reason");
   const [unreadNotifications, setUnreadNotifications] = useState([]);
+  const [latestNotification, setLatestNotification] = useState(null);
   const [modalNotifications, setModalNotifications] = useState([]);
   const [showNotificationModal, setShowNotificationModal] = useState(false);
   const [showNotificationPanel, setShowNotificationPanel] = useState(false);
@@ -45,6 +46,7 @@ function App() {
         const fresh = data.new_notifications || [];
 
         setUnreadNotifications(unread);
+        setLatestNotification(data.latest_notification || null);
         setLastChecked(data.last_successful_check || null);
         setNotificationCheckError("");
 
@@ -163,32 +165,23 @@ function App() {
   setAnalysisData(null);
   setAnalysisError("");
 
+  const sourceParams = new URLSearchParams({
+    title: notification.title || "",
+    uploaded_date: notification.uploaded_date || "",
+    pdf_url: notification.pdf_url || "",
+  });
+
   try {
-    // Get the extracted file name from the notification
-    const extractedFile =
-      notification.extracted_file ||
-      notification.extracted_filename ||
-      notification.filename;
-
-    console.log("Extracted file:", extractedFile);
-
-    if (!extractedFile) {
-      setAnalysisError(
-        "This official notification has not yet been processed into the local AI pipeline."
-      );
-      return;
-    }
-
-    // Get extracted notification data
+    // Fetch (downloading/extracting on demand if not already processed)
+    // the notification's extracted text.
     const response = await fetch(
-      `${API_BASE_URL}/api/notification/${encodeURIComponent(
-        extractedFile
-      )}`
+      `${API_BASE_URL}/api/notification-details?${sourceParams}`
     );
 
     if (!response.ok) {
+      const errorBody = await response.json().catch(() => ({}));
       throw new Error(
-        `Failed to fetch extracted notification data: ${response.status}`
+        errorBody.detail || `Failed to fetch notification data: ${response.status}`
       );
     }
 
@@ -200,14 +193,13 @@ function App() {
 
     // Get Gemini analysis
     const analysisResponse = await fetch(
-      `${API_BASE_URL}/api/analyze-notification/${encodeURIComponent(
-        extractedFile
-      )}`
+      `${API_BASE_URL}/api/analyze-notification-by-source?${sourceParams}`
     );
 
     if (!analysisResponse.ok) {
+      const errorBody = await analysisResponse.json().catch(() => ({}));
       throw new Error(
-        `Failed to analyze notification: ${analysisResponse.status}`
+        errorBody.detail || `Failed to analyze notification: ${analysisResponse.status}`
       );
     }
 
@@ -218,9 +210,15 @@ function App() {
     setAnalysisData(analysis);
   } catch (error) {
     console.error("Notification detail error:", error);
-    setAnalysisError("Unable to load local extraction or AI analysis for this notification.");
+    setAnalysisError(
+      error.message || "Unable to load local extraction or AI analysis for this notification."
+    );
   }
 };
+
+  const selectedNotificationNumber = selectedNotification
+    ? results.findIndex((notification) => notification.id === selectedNotification.id) + 1
+    : 0;
 
   return (
     <div className="app">
@@ -237,21 +235,31 @@ function App() {
         </div>
 
         <div className="header-actions">
-          {unreadNotifications.length > 0 && (
-            <div
-              className="notification-marquee"
-              title="New FSSAI Gazette notifications"
+          {latestNotification && (
+            <button
+              type="button"
+              className="latest-notification-chip"
+              title={`${latestNotification.title} · ${latestNotification.uploaded_date}`}
+              onClick={() => {
+                setResults([latestNotification]);
+                setSearched(true);
+                setShowNotificationPanel(false);
+                markNotificationsRead([latestNotification]);
+                handleNotificationClick(latestNotification);
+              }}
             >
-              <div className="notification-marquee-track">
-                {[...unreadNotifications.slice(0, 3), ...unreadNotifications.slice(0, 3)].map(
-                  (notification, index) => (
-                    <span key={`${notification.id}-${index}`}>
-                      <strong>NEW:</strong> {notification.title} · {notification.uploaded_date}
-                    </span>
-                  )
-                )}
-              </div>
-            </div>
+              <span className="latest-notification-tag">LATEST</span>
+              <span className="latest-notification-marquee">
+                <span className="latest-notification-marquee-track">
+                  <span className="latest-notification-text">
+                    {latestNotification.title} · {latestNotification.uploaded_date}
+                  </span>
+                  <span className="latest-notification-text" aria-hidden="true">
+                    {latestNotification.title} · {latestNotification.uploaded_date}
+                  </span>
+                </span>
+              </span>
+            </button>
           )}
 
           <div className="notification-monitor">
@@ -270,7 +278,11 @@ function App() {
 
             {showNotificationPanel && (
               <div className="notification-dropdown">
-                <p className="notification-dropdown-title">NEW GAZETTE NOTIFICATIONS</p>
+                <p className="notification-dropdown-title">
+                  {unreadNotifications.length > 0
+                    ? "NEW GAZETTE NOTIFICATIONS"
+                    : "LATEST GAZETTE NOTIFICATION"}
+                </p>
                 {unreadNotifications.length > 0 ? (
                   unreadNotifications.map((notification) => (
                     <button
@@ -289,8 +301,23 @@ function App() {
                       <span>{notification.uploaded_date}</span>
                     </button>
                   ))
+                ) : latestNotification ? (
+                  <button
+                    type="button"
+                    className="notification-dropdown-item"
+                    onClick={() => {
+                      setResults([latestNotification]);
+                      setSearched(true);
+                      setShowNotificationPanel(false);
+                      markNotificationsRead([latestNotification]);
+                      handleNotificationClick(latestNotification);
+                    }}
+                  >
+                    <strong>{latestNotification.title}</strong>
+                    <span>{latestNotification.uploaded_date}</span>
+                  </button>
                 ) : (
-                  <p className="notification-dropdown-empty">No new Gazette notifications.</p>
+                  <p className="notification-dropdown-empty">No Gazette notifications found yet.</p>
                 )}
               </div>
             )}
@@ -421,9 +448,7 @@ function App() {
                 {results.map((notification,index) => (
                   <button
                     key={notification.id || index}
-                    className={`notification-card notification-card-${
-                      notification.id
-                    } ${
+                    className={`notification-card ${
                       selectedNotification?.id === notification.id
                         ? "selected-notification"
                         : ""
@@ -432,7 +457,7 @@ function App() {
                   >
                     <div className="notification-card-top">
                       <span className="notification-number">
-                        #{notification.id}
+                        #{index + 1}
                       </span>
 
                       <span className="notification-date">
@@ -503,7 +528,8 @@ function App() {
               <div className="selected-notification-header">
 
                 <p className="selected-label">
-                  SELECTED NOTIFICATION #{selectedNotification.id}
+                  SELECTED NOTIFICATION
+                  {selectedNotificationNumber > 0 ? ` #${selectedNotificationNumber}` : ""}
                 </p>
 
                 <h3>{selectedNotification.title}</h3>
@@ -698,6 +724,8 @@ function App() {
         )}
 
       </div>
+    ) : analysisError ? (
+      <p>{analysisError}</p>
     ) : (
       <p>
         Loading notification analysis...
@@ -745,6 +773,8 @@ function App() {
         )}
 
       </div>
+    ) : analysisError ? (
+      <p>{analysisError}</p>
     ) : (
       <p>
         Loading notification analysis...

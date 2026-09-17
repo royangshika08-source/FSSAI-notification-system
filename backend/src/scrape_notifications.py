@@ -38,7 +38,7 @@ DEFAULT_END_DATE = datetime.strptime(
 ).date()
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
@@ -178,6 +178,13 @@ def extract_current_page(
 
     records = []
 
+    # The portal lists notifications newest-first.  Tracking the oldest date
+    # seen anywhere on this page (regardless of whether that row is a PDF
+    # link we keep) lets the caller stop paging once every remaining page is
+    # guaranteed to be older than the requested range, instead of always
+    # walking the entire multi-hundred-entry archive.
+    page_dates = []
+
     # --------------------------------------------------------
     # PROCESS EACH LINK
     # --------------------------------------------------------
@@ -195,6 +202,34 @@ def extract_current_page(
         row_text = (
             item.get("row_text") or ""
         ).strip()
+
+        # ----------------------------------------------------
+        # Extract date (recorded even for non-PDF rows so the
+        # caller can detect when a page has moved entirely past
+        # the requested date range)
+        # ----------------------------------------------------
+
+        date_match = re.search(
+            r"\b\d{2}-\d{2}-\d{4}\b",
+            row_text
+        )
+
+        parsed_date = None
+
+        if date_match:
+
+            try:
+
+                parsed_date = datetime.strptime(
+                    date_match.group(0),
+                    "%d-%m-%Y"
+                ).date()
+
+                page_dates.append(parsed_date)
+
+            except ValueError:
+
+                pass
 
         # ----------------------------------------------------
         # Only PDF/download links
@@ -217,30 +252,10 @@ def extract_current_page(
         if not row_text:
             continue
 
-        # ----------------------------------------------------
-        # Extract date
-        # ----------------------------------------------------
-
-        date_match = re.search(
-            r"\b\d{2}-\d{2}-\d{4}\b",
-            row_text
-        )
-
-        if not date_match:
+        if parsed_date is None:
             continue
 
         uploaded_date = date_match.group(0)
-
-        try:
-
-            parsed_date = datetime.strptime(
-                uploaded_date,
-                "%d-%m-%Y"
-            ).date()
-
-        except ValueError:
-
-            continue
 
         # ----------------------------------------------------
         # Required date range
@@ -335,7 +350,9 @@ def extract_current_page(
             }
         )
 
-    return records
+    oldest_date_on_page = min(page_dates) if page_dates else None
+
+    return records, oldest_date_on_page
 
 
 # ============================================================
@@ -623,7 +640,7 @@ def main(
                 f"of {pagination['total']})..."
             )
 
-            records = extract_current_page(
+            records, oldest_date_on_page = extract_current_page(
                 driver,
                 page_number,
                 start_date,
@@ -646,6 +663,23 @@ def main(
             if pagination["last"] >= pagination["total"]:
 
                 print("Reached the final official FSSAI result page.")
+
+                break
+
+            # The portal lists notifications newest-first.  Once an entire
+            # page is already older than the requested range, every
+            # following page is guaranteed to be older still, so a recent
+            # (e.g. last-7-days) check does not need to walk the full
+            # archive on every poll.
+            if (
+                oldest_date_on_page is not None
+                and oldest_date_on_page < start_date
+            ):
+
+                print(
+                    "Remaining pages are older than the requested "
+                    "start date - stopping early."
+                )
 
                 break
 

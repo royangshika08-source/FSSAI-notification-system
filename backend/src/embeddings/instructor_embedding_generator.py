@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 # PROJECT PATHS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = Path(__file__).resolve().parents[3]
 
 CHUNKS_DIR = (
     BASE_DIR

@@ -5,14 +5,54 @@ from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+
+def _is_transient_gemini_error(exception):
+    """Gemini occasionally returns 503 UNAVAILABLE during demand spikes.
+
+    Google's own error message describes this as temporary, so a short
+    retry avoids surfacing a hard failure to the user for something that
+    usually succeeds a few seconds later.
+    """
+    return (
+        isinstance(exception, genai_errors.ServerError)
+        and exception.code in (503, 429)
+    )
+
+
+gemini_retry = retry(
+    retry=retry_if_exception(_is_transient_gemini_error),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    reraise=True,
+)
+
+
+@gemini_retry
+def _generate_content(prompt, response_schema):
+    return gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema
+        )
+    )
 
 
 # ============================================================
 # PROJECT PATHS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+BASE_DIR = Path(__file__).resolve().parents[3]
 
 
 # ============================================================
@@ -487,14 +527,7 @@ the retrieved document chunks.
 
     print("\nCalling Gemini...")
 
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=response_schema
-        )
-    )
+    response = _generate_content(prompt, response_schema)
 
     return response.text
 # ============================================================
@@ -903,14 +936,7 @@ Return the result as structured JSON.
 
     print("\nAnalyzing selected notification with Gemini...")
 
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=response_schema
-        )
-    )
+    response = _generate_content(prompt, response_schema)
 
     return response.text
 

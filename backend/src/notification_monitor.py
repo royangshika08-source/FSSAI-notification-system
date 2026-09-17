@@ -8,7 +8,7 @@ from pathlib import Path
 from src.scrape_notifications import main as scrape_notifications
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
 STATE_FILE = OUTPUT_DIR / "notification_state.json"
 DISCOVERY_FILE = OUTPUT_DIR / "latest_fssai_notifications.json"
@@ -139,6 +139,7 @@ def check_for_new_notifications():
                         recent_start,
                     ),
                     "fresh_notifications": [],
+                    "latest_notification": latest_known_notification(state),
                     "last_successful_check": last_check,
                 }
         except ValueError:
@@ -197,6 +198,7 @@ def check_for_new_notifications():
     return {
         "notifications": unread_notifications,
         "fresh_notifications": fresh_notifications,
+        "latest_notification": latest_known_notification(state),
         "last_successful_check": timestamp,
     }
 
@@ -222,6 +224,28 @@ def expire_old_unread_notifications(state, recent_start):
         ):
             notification["read"] = True
             notification["expired_at"] = timestamp
+
+
+def latest_known_notification(state):
+    """Return the single most recently published notification, if any.
+
+    Unlike unread_notifications_from_state, this ignores read status and the
+    recent-window cutoff, so the bell panel always has something to show
+    instead of appearing empty once everything has been marked read.
+    """
+    dated_notifications = [
+        (notification_date(notification), notification)
+        for notification in state["notifications"].values()
+    ]
+    dated_notifications = [
+        item for item in dated_notifications if item[0] is not None
+    ]
+
+    if not dated_notifications:
+        return None
+
+    dated_notifications.sort(key=lambda item: item[0], reverse=True)
+    return dated_notifications[0][1].copy()
 
 
 def unread_notifications_from_state(state, recent_start=None):

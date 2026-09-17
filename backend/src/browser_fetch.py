@@ -12,7 +12,7 @@ TARGET_URL = (
 )
 
 OUTPUT_FILE = (
-    Path(__file__).resolve().parent.parent
+    Path(__file__).resolve().parent.parent.parent
     / "data"
     / "raw"
     / "fssai_page_1.html"
